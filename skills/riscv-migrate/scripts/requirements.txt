@@ -1,0 +1,7 @@
+pyahocorasick
+python-magic
+chardet
+
+# MCP/知识库查询（scripts/query.py）
+-r requirements-mcp.txt
+
