@@ -76,8 +76,8 @@ RISC-V 全栈迁移工具链 Claude Code 插件。面向 x86/ARM 代码库，提
 在 Claude Code 中执行（以下命令均在 Claude Code 的输入框中以 `/` 开头输入）：
 
 ```text
-# 1. 添加本地 marketplace（在插件根的父目录下用相对路径，或直接给绝对路径）
-/plugin marketplace add /home/10356995/xbr_doc/xbr/zf-riscv-everything/everything-riscv
+# 1. 添加 marketplace（在插件根的父目录下用相对路径，或直接给绝对路径）
+/plugin marketplace add <gerrit_url>
 
 # 2. 安装插件：<plugin-name>@<marketplace-name>，两者均为 everything-riscv
 /plugin install everything-riscv@everything-riscv

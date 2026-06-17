@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "everything-riscv",
+  "description": "RISC-V 全栈迁移工具链 Claude Code 插件：扫描 x86/ARM → 迁移到 RISC-V（含 RVV）→ 远端知识库查询 → QEMU 验证 → llvm-mca 热点性能分析",
+  "owner": {
+    "name": "ZF-eco"
+  },
+  "plugins": [
+    {
+      "name": "everything-riscv",
+      "description": "RISC-V 全栈迁移工具链：扫描 x86/ARM 代码库 → 迁移到 RISC-V（含 RVV 向量扩展）→ 远端知识库查询 → QEMU 验证 → llvm-mca 热点性能分析，形成「扫描→迁移→验证→优化」一体化闭环",
+      "version": "0.1.0",
+      "source": ".",
+      "author": {
+        "name": "ZF-eco"
+      }
+    }
+  ]
+}
