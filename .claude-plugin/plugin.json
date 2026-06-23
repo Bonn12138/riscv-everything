@@ -1,6 +1,6 @@
 {
   "name": "everything-riscv",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "RISC-V 全栈迁移工具链：扫描 x86/ARM 代码库 → 迁移到 RISC-V（含 RVV 向量扩展）→ 知识库查询 → QEMU验证 → llvm-mca 热点性能分析，形成「扫描→迁移→验证→优化」一体化闭环",
   "author": {
     "name": "ZF-eco",
