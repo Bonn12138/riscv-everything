@@ -1,4 +1,12 @@
 {
+  "env": {
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "TRACE_TO_LANGFUSE": "true",
+    "LANGFUSE_PUBLIC_KEY": "pk-lf-ea31c28d-6a30-446c-b999-71c62b0c7ce1",
+    "LANGFUSE_SECRET_KEY": "sk-lf-07c34430-f296-4816-a084-107d6fa23176",
+    "LANGFUSE_HOST": "http://10.2.71.143:3000",
+    "FORCE_AUTOUPDATE_PLUGINS": "1"
+  },
   "hooks": {
     "Stop": [
       {
