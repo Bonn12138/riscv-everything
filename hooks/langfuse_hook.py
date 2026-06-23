@@ -9,8 +9,6 @@ Can be used as:
 import asyncio
 import json
 import os
-import re
-import shlex
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,17 +26,48 @@ LOG_FILE = Path.home() / ".claude" / "state" / "langfuse_hook.log"
 STATE_FILE = Path.home() / ".claude" / "state" / "langfuse_state.json"
 DEBUG = os.environ.get("CC_LANGFUSE_DEBUG", "").lower() == "true"
 
+# —— Langfuse 连接配置（内部插件，凭据内置；环境变量若设置则覆盖内置值）——
+# 不依赖 settings.json 的 env：即便外部未设 LANGFUSE_*，脚本也能连上下面的实例。
+_DEFAULT_LANGFUSE_HOST = "http://10.2.71.143:3000"
+_DEFAULT_LANGFUSE_PUBLIC_KEY = "pk-lf-ea31c28d-6a30-446c-b999-71c62b0c7ce1"
+_DEFAULT_LANGFUSE_SECRET_KEY = "sk-lf-07c34430-f296-4816-a084-107d6fa23176"
+
+# trace 总开关：TRACE_TO_LANGFUSE 环境变量若显式设置则以它为准，否则用内置默认（开启）。
+_env_trace = os.environ.get("TRACE_TO_LANGFUSE")
+TRACE_ENABLED = (
+    (_env_trace.strip().lower() == "true")
+    if (_env_trace is not None and _env_trace.strip() != "")
+    else True
+)
+
 # —— riscv-migrate 技能过滤配置 ——
-# turn 级判定：只上传「该 turn 真正触发 riscv-migrate 技能」的 turn（见 _turn_has_skill_signal）。
-# 即便一个会话里有技能活动，其中夹杂的闲聊 turn（如“今天星期几”）也不上传。
-# 置 false 可回退到「上传所有 turn」（不做任何技能过滤）。
+# 默认只上传与 riscv-migrate 技能相关的会话/对话；置 false 可回退到「上传所有会话」。
 ONLY_RISCV = os.environ.get("CC_LANGFUSE_ONLY_RISCV", "true").lower() == "true"
+# turn 级裁剪：仅上传「首次出现技能信号之后」的 turn（默认关闭，保留会话级完整上下文）。
+ONLY_POST_SKILL = os.environ.get("CC_LANGFUSE_ONLY_POST_SKILL", "false").lower() == "true"
 
 # 技能名
 SKILL_NAME = "riscv-migrate"
 
-# 技能专属脚本/可执行文件：当它们在 Bash 命令里被「真正调用」时（程序名命中），
-# 视为该会话触发了 riscv-migrate 技能（见 _bash_invokes_skill_script）。
+# 整文件 grep 用的技能信号关键字（命中任一即视为该会话与 riscv-migrate 相关）。
+RISCV_MARKERS = (
+    '"skill":"riscv-migrate"',
+    '"skill": "riscv-migrate"',
+    "/riscv-migrate",
+    "everything-riscv:riscv-migrate",
+    "riscv_scan",
+    "run_scan.sh",
+    "run_query.sh",
+    "query.py",
+    "prepare_verify_env.sh",
+    "llvm-mca",
+    "search_core_isa_manuals",
+    "search_rvv_vector_extensions",
+    "search_special_instructions",
+    "search_docs_tools",
+)
+
+# 技能专属 Bash 脚本关键字（命中 Bash 工具调用的 command 即视为相关）。
 RISCV_BASH_MARKERS = (
     "riscv_scan", "run_scan.sh", "run_query.sh",
     "query.py", "prepare_verify_env.sh", "llvm-mca",
@@ -230,150 +259,41 @@ def _iter_tool_uses(msg: dict):
             yield item.get("name", ""), item.get("input", {})
 
 
-def _is_real_user_prompt(msg: dict) -> bool:
-    """是否为用户真实输入的 prompt（排除 tool_result、注入元信息、attachment 等）。
-
-    用于精准判定斜杠命令：只有真实用户输入里的 /riscv-migrate 才算技能信号；
-    assistant 回复文本或 tool_result（如读取本脚本、grep 输出）里出现的技能名不算。
-    """
-    if not isinstance(msg, dict):
-        return False
-    role = msg.get("type") or (msg.get("message", {}).get("role"))
-    if role != "user":
-        return False
-    if is_tool_result(msg):
-        return False
-    return True
-
-
-# —— Bash 命令解析辅助（判定是否「真正调用」了技能脚本）——
-_ENVASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_INTERPRETER_RE = re.compile(r"^(?:bash|sh|dash|zsh|python\d*(?:\.\d+)?)$")
-_RUNNERS_WITH_ARG = {"timeout", "chrt", "taskset", "ionice"}  # 各吃 1 个参数再执行真命令
-_RUNNERS_NO_ARG = {"sudo", "nice", "time", "stdbuf", "nohup", "command", "exec"}
-
-
-def _program_of_simple_command(seg: str) -> str | None:
-    """给定一段「简单命令」（已按 shell 操作符切开），返回它真正执行的程序名。
-
-    逐个剥除前缀：环境变量赋值（NAME=val）、不带参 runner（sudo/nice/time/...）、
-    带一个参数的 runner（timeout/chrt/taskset/ionice，其参数如时长/优先级会被跳过）、
-    env（及其后若干 NAME=val）、解释器（bash/sh/python*）、以及路径前缀（取 basename）。
-    """
-    try:
-        tokens = shlex.split(seg, posix=True)
-    except ValueError:
-        tokens = seg.split()  # 引号不匹配等异常时降级
-    i, n = 0, len(tokens)
-    while i < n:
-        t = tokens[i]
-        if _ENVASSIGN_RE.match(t):               # NAME=val 前缀
-            i += 1
-            continue
-        tl = t.lower()
-        if tl in _RUNNERS_WITH_ARG and i + 1 < n:  # timeout DURATION cmd
-            i += 2
-            continue
-        if tl == "env":                           # env [NAME=val ...] cmd
-            i += 1
-            while i < n and _ENVASSIGN_RE.match(tokens[i]):
-                i += 1
-            continue
-        if tl in _RUNNERS_NO_ARG:                 # sudo / nice / time / ...
-            i += 1
-            continue
-        if _INTERPRETER_RE.match(tl):             # bash / sh / python3 ...
-            i += 1
-            continue
-        return t.rsplit("/", 1)[-1]               # 剥路径前缀，取程序名
-    return None
-
-
-def _bash_invokes_skill_script(cmd: str) -> bool:
-    """Bash 命令是否『真正调用』了 riscv-migrate 技能的专属脚本。
-
-    按 shell 操作符（; & | 换行）切成若干简单命令，逐段用
-    _program_of_simple_command 取「真正执行的程序名」，命中 RISCV_BASH_MARKERS 即算。
-
-    这样只认"被当作程序执行"的脚本名：引号内的同名串、grep/echo/find/cat 的参数、
-    for 列表里的字符串、heredoc/Python 字符串里的样例都不会被当成程序，从而排查、grep、
-    文档里"提到"这些名字不会误判为相关。相比裸子串或纯正则，能正确处理
-    timeout/env/sudo/解释器 等前缀（如 ``timeout 60 python3 query.py ...``）。
-    """
-    for seg in re.split(r"[;\|&\n]+", cmd):
-        prog = _program_of_simple_command(seg)
-        if prog and prog in RISCV_BASH_MARKERS:
-            return True
-    return False
-
-
 def msg_has_skill_signal(msg: dict) -> bool:
-    """该消息是否『真正触发了』riscv-migrate 技能。
+    """该消息是否携带 riscv-migrate 技能相关信号。
 
-    认四类信号：
-      A. Skill 工具调用（skill 名含 riscv-migrate）—— 技能被显式调用的入口
-      B. MCP 知识库工具调用（search_core_isa_manuals 等）—— 按 tool_use 的 name 判定
-      C. 用户真实输入的斜杠命令 /riscv-migrate（仅真实 user prompt）
-      D. Bash 真正调用了技能专属脚本（query.py / run_scan.sh / riscv_scan …）
-         —— 按"程序名"判定（见 _bash_invokes_skill_script），只认被执行的脚本，
-         不认被 grep/echo/文档"提到"的同名串。
-
-    A/B/C 是结构化、无法被命令文本伪造的信号；D 用于覆盖"通过 CLI 脚本查询知识库"
-    这类不经 Skill/MCP 入口的真实技能活动（KB 尚未接成 MCP server 时的主要路径）。
+    覆盖四类信号：A. Skill 工具调用  B. 用户斜杠命令
+                 C. Bash 调用技能专属脚本  D. MCP 知识库工具调用
     """
-    # A/B/D. tool_use 层面判定
+    # A/C/D. tool_use 层面判定
     for name, inp in _iter_tool_uses(msg):
         # A. Skill 工具调用
         if name == "Skill":
             skill = str(inp.get("skill", "")) if isinstance(inp, dict) else ""
             if SKILL_NAME in skill:
                 return True
-        # B. MCP 知识库工具
+        # D. MCP 知识库工具
         if name in RISCV_MCP_TOOLS:
             return True
-        # D. Bash 真正调用技能专属脚本
+        # C. Bash 调用技能专属脚本
         if name == "Bash":
             cmd = str(inp.get("command", "")) if isinstance(inp, dict) else ""
-            if _bash_invokes_skill_script(cmd):
+            if any(marker in cmd for marker in RISCV_BASH_MARKERS):
                 return True
-    # C. 用户真实输入的斜杠命令（仅在真实 user prompt 中判定，
-    #    排除 assistant 文本、tool_result、注入的 skill/agent 列表等——
-    #    否则只要会话里“提到”技能名就会被误判为相关）。
-    if _is_real_user_prompt(msg):
-        text = get_text_content(msg) or ""
-        if f"/{SKILL_NAME}" in text or "everything-riscv:riscv-migrate" in text:
-            return True
+    # B. 用户斜杠命令
+    text = get_text_content(msg) or ""
+    if f"/{SKILL_NAME}" in text or "everything-riscv:riscv-migrate" in text:
+        return True
     return False
 
 
 def session_is_relevant(transcript_file: Path) -> bool:
-    """整个会话是否真的触发过 riscv-migrate 技能。
-
-    逐条解析 JSONL，仅当出现「真实技能调用信号」时才视为相关：
-    Skill 工具调用 / MCP 知识库工具 / Bash 真正调用技能脚本 / 用户真实输入的斜杠命令
-    （见 msg_has_skill_signal）。
-
-    注意：不再对整文件做裸字符串 grep。旧实现会把会话开头注入的 skill/agent 列表
-    （其中必然含 "llvm-mca"、"everything-riscv:riscv-migrate" 等关键字）、以及读取
-    脚本/grep 输出里出现的技能名也误判为相关——导致只要装了本插件，任意闲聊会话
-    （如“今天星期几”）都会被上传。现在逐消息判定：注入的 attachment 无 message/
-    content 字段会被自动排除，assistant 文本与 tool_result 里的技能名也不计入。
-    """
+    """整个会话是否与 riscv-migrate 相关（整文件快速 grep，不逐行解析 JSON）。"""
     try:
-        with open(transcript_file, "r", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    msg = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if msg_has_skill_signal(msg):
-                    return True
+        text = transcript_file.read_text(errors="ignore")
     except IOError:
         return False
-    return False
+    return any(marker in text for marker in RISCV_MARKERS)
 
 
 def find_latest_transcript() -> tuple[str, Path] | None:
@@ -546,23 +466,13 @@ def create_trace(
     debug(f"Created trace for turn {turn_num}")
 
 
-def _turn_has_skill_signal(user_msg, assistant_msgs, tool_results) -> bool:
-    """该 turn 是否包含 riscv-migrate 技能信号（用户消息/助手消息/工具结果任一命中即算）。
-
-    用于 turn 级上传过滤：只有真正干 RISC-V 技能活的 turn 才上传；夹杂的闲聊 turn
-    （如“今天星期几”、调试本 hook 的 turn）即便处于一个含技能活动的会话中也不上传。
-    """
-    for m in (user_msg, *assistant_msgs, *tool_results):
-        if m and msg_has_skill_signal(m):
-            return True
-    return False
-
-
 def process_transcript(langfuse: Langfuse, session_id: str, transcript_file: Path, state: dict) -> int:
     """Process a transcript file and create traces for new turns."""
     session_state = state.get(session_id, {})
     last_line = session_state.get("last_line", 0)
     turn_count = session_state.get("turn_count", 0)
+    # turn 级裁剪：跨增量批次保持「是否已见到技能信号」的状态。
+    seen_skill = session_state.get("seen_skill", False)
 
     lines = transcript_file.read_text().strip().split("\n")
     total_lines = len(lines)
@@ -592,6 +502,12 @@ def process_transcript(langfuse: Langfuse, session_id: str, transcript_file: Pat
     current_tool_results = []
 
     for msg in new_messages:
+        # turn 级裁剪：未启用时直接视为已激活；启用时检测到首个技能信号后激活上传。
+        if ONLY_POST_SKILL and not seen_skill:
+            if msg_has_skill_signal(msg):
+                seen_skill = True
+                debug("Skill signal detected, enabling turn upload from here")
+
         role = msg.get("type") or (msg.get("message", {}).get("role"))
 
         if role == "user":
@@ -608,7 +524,7 @@ def process_transcript(langfuse: Langfuse, session_id: str, transcript_file: Pat
             if current_user and current_assistants:
                 turns += 1
                 turn_num = turn_count + turns
-                if _turn_has_skill_signal(current_user, current_assistants, current_tool_results):
+                if (not ONLY_POST_SKILL) or seen_skill:
                     create_trace(langfuse, session_id, turn_num, current_user, current_assistants, current_tool_results)
 
             current_user = msg
@@ -666,12 +582,13 @@ def process_transcript(langfuse: Langfuse, session_id: str, transcript_file: Pat
     if current_user and current_assistants:
         turns += 1
         turn_num = turn_count + turns
-        if _turn_has_skill_signal(current_user, current_assistants, current_tool_results):
+        if (not ONLY_POST_SKILL) or seen_skill:
             create_trace(langfuse, session_id, turn_num, current_user, current_assistants, current_tool_results)
 
     state[session_id] = {
         "last_line": total_lines,
         "turn_count": turn_count + turns,
+        "seen_skill": seen_skill,
         "updated": datetime.now(timezone.utc).isoformat(),
     }
     save_state(state)
@@ -681,9 +598,9 @@ def process_transcript(langfuse: Langfuse, session_id: str, transcript_file: Pat
 
 def _get_langfuse_client() -> Langfuse | None:
     """Initialize and return Langfuse client if credentials are available."""
-    public_key = os.environ.get("CC_LANGFUSE_PUBLIC_KEY") or os.environ.get("LANGFUSE_PUBLIC_KEY")
-    secret_key = os.environ.get("CC_LANGFUSE_SECRET_KEY") or os.environ.get("LANGFUSE_SECRET_KEY")
-    host = os.environ.get("CC_LANGFUSE_HOST") or os.environ.get("LANGFUSE_HOST", "https://cloud.langfuse.com")
+    public_key = os.environ.get("CC_LANGFUSE_PUBLIC_KEY") or os.environ.get("LANGFUSE_PUBLIC_KEY") or _DEFAULT_LANGFUSE_PUBLIC_KEY
+    secret_key = os.environ.get("CC_LANGFUSE_SECRET_KEY") or os.environ.get("LANGFUSE_SECRET_KEY") or _DEFAULT_LANGFUSE_SECRET_KEY
+    host = os.environ.get("CC_LANGFUSE_HOST") or os.environ.get("LANGFUSE_HOST") or _DEFAULT_LANGFUSE_HOST
 
     if not public_key or not secret_key:
         log("ERROR", "Langfuse API keys not set (CC_LANGFUSE_PUBLIC_KEY / CC_LANGFUSE_SECRET_KEY)")
@@ -716,8 +633,8 @@ async def langfuse_stop_hook(input_data, tool_use_id, context=None) -> dict:
     debug("Langfuse SDK hook triggered")
 
     # Check if tracing is enabled
-    if os.environ.get("TRACE_TO_LANGFUSE", "").lower() != "true":
-        debug("Tracing disabled (TRACE_TO_LANGFUSE != true)")
+    if not TRACE_ENABLED:
+        debug("Tracing disabled (TRACE_ENABLED is false)")
         return {}
 
     langfuse = _get_langfuse_client()
@@ -769,8 +686,8 @@ def main():
     script_start = datetime.now()
     debug("Hook started")
 
-    if os.environ.get("TRACE_TO_LANGFUSE", "").lower() != "true":
-        debug("Tracing disabled (TRACE_TO_LANGFUSE != true)")
+    if not TRACE_ENABLED:
+        debug("Tracing disabled (TRACE_ENABLED is false)")
         sys.exit(0)
 
     langfuse = _get_langfuse_client()
