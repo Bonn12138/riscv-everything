@@ -6,8 +6,9 @@ RISC-V 全栈迁移工具链 Claude Code 插件。面向 x86/ARM 代码库，提
 
 本插件围绕一个核心技能 `riscv-migrate` 构建，配套：
 
-- **3 条斜杠命令** — 快速启动扫描 / 迁移 / 验证流程
+- **7 条斜杠命令** — 3 条单 agent 流程（扫描 / 迁移 / 验证）+ 4 条多智能体 swarm 命令（classify / migrate / verify / mca，见下文「批量并行模式」）
 - **2 个专用智能体** — 迁移代码审查 + 汇编热点分析
+- **多智能体 workflow 编排** — 大规模迁移（50+ 条目）时按文件/tier 并行 + 对抗式 2 票审查 + 循环收敛（`-swarm` 命令）
 - **远端知识库查询** — 通过技能内置脚本连接远端 RISC-V 文档 MCP 服务，查询 ISA / RVV 文档，**无需本地部署服务端**
 
 ## 技能
@@ -37,6 +38,23 @@ RISC-V 全栈迁移工具链 Claude Code 插件。面向 x86/ARM 代码库，提
 | `/everything-riscv:scan` | 扫描工程，生成待迁移点清单 |
 | `/everything-riscv:migrate` | 启动迁移流程（按条目逐项迁移） |
 | `/everything-riscv:verify` | 触发 QEMU 验证：自动准备工具链 → 编译 → 输出对比 → 回流修复 |
+
+## 批量并行模式（workflow）
+
+大规模迁移（50+ 条目）时，用多智能体 workflow 命令替代单 agent 串行流程。每条 `-swarm` 命令启动一个 workflow 脚本（`skills/riscv-migrate/workflows/*.workflow.js`），按文件 / tier 并行 + 对抗式 2 票审查 + 循环收敛：
+
+| 命令 | workflow | 作用 |
+|---|---|---|
+| `/everything-riscv:classify-swarm` | `classify.workflow.js` | 批量预分流，产出 `classified.json` + 初始化 `progress.json` |
+| `/everything-riscv:migrate-swarm` | `migrate-batch.workflow.js` | 按 tier 分批并行迁移 + 2 票 review + 修复（支持断点续传） |
+| `/everything-riscv:verify-swarm` | `verify-swarm.workflow.js` | QEMU 对比 baseline 循环收敛，修真发散 |
+| `/everything-riscv:mca-swarm` | `mca-analyze.workflow.js` | 对 `asm_hotspot` 并行 llvm-mca 分析 + 迭代优化 |
+
+典型串联：`scan → classify-swarm → migrate-swarm → verify-swarm → mca-swarm`。
+
+- 进度落在 `<target>/.riscv_migrate/progress.json`，自动跳过已 `done` 条目，可随时重跑续传。
+- 每次发起 workflow 需用户授权（opt-in），属预期行为。
+- 设计约定（参数化、HARD RULES、anti-reward-hack、并发聚合）见 `skills/riscv-migrate/referens/workflow_patterns.md`，技能内说明见 `SKILL.md` 阶段 F。
 
 ## 智能体
 
@@ -137,12 +155,12 @@ everything-riscv/
 │   └── riscv-migrate/          # 核心技能
 │       ├── SKILL.md
 │       ├── scripts/            # 扫描 / 知识库查询 / 验证环境准备脚本
-│       ├── referens/           # 迁移与扫描细则
+│       ├── workflows/          # 多智能体 workflow 编排脚本（*-swarm 命令发起）
+│       ├── referens/           # 迁移 / 扫描 / workflow 设计细则
 │       └── resources/          # 工具链 / QEMU / llvm-mca 环境部署脚本
 ├── commands/                   # 斜杠命令（/everything-riscv:<name>）
-│   ├── scan.md
-│   ├── migrate.md
-│   └── verify.md
+│   ├── scan.md / migrate.md / verify.md          # 单 agent 流程
+│   └── *-swarm.md (×4)                           # 多智能体 workflow（classify/migrate/verify/mca）
 └── agents/                     # 专用智能体
     ├── riscv-code-reviewer.md
     └── riscv-asm-analyzer.md
