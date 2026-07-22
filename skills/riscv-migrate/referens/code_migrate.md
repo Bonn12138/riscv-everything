@@ -1,6 +1,22 @@
 # 迁移点迁移（code_migrate）
 
-针对 `scan_result.json` 中的某条条目（通常来自 `suggestion_class[]` / `missing_class[]` 或单文件内若干点），先按 **前三步** 完成迁移与功能性对比；涉及 **手写汇编 / RVV 汇编 / intrinsic 热点** 且第三步已通过时，须再执行 **第四步（llvm-mca，阶段 E）**（见本文第四节）。可与用户约定一次处理一条或整文件。
+本文对应 `riscv-migrate` 技能**阶段二 2.2 / 2.3 / 2.4** 的实施细则，并衔接**阶段三（工程级交叉编译）**与**阶段四（llvm-mca 性能分析，独立 agent）**。扫描与分流依据见 [project_scan.md](project_scan.md)。
+
+## 在三大阶段中的位置
+
+```
+阶段一(扫描) → 阶段二(本文档核心)
+                  ├─ 2.1 分流
+                  ├─ 2.2 迁移(将 status: TODO → START)
+                  ├─ 2.3 知识库查询
+                  └─ 2.4 验证 (将 status: START → DONE + 填 marking)
+              → 阶段三(工程级交叉编译)
+              → 阶段四(独立 agent: riscv-asm-analyzer)
+```
+
+每个条目的状态以 `scan_result.json` 中的 `status` 与 `marking` 两个结构化字段同步（**权威源在 JSON，不在源码注释**）。详见末节「迁移点状态字段规范」。
+
+---
 
 ## 工具与知识
 
@@ -14,32 +30,105 @@ python3 scripts/query.py -t search_core_isa_manuals -q "vadd.vv"
 python3 scripts/query.py -t search_rvv_vector_extensions -q "__riscv_vsetvl"
 ```
 
-## 第一步：单元测试（源实现 + RISC-V 共用）
+---
+
+## 阶段二 2.2：迁移（按分流结果）
+
+### 通用要求
+
+- **测试先行**：为**原始 x86/ARM 实现**与**即将编写的 RISC-V 实现**补齐或编写可运行的单元测试（同一行为、可对比输出或 checksum）。无测试不得宣称迁移完成。
+- **新增源文件命名带 `_riscv` 后缀**（与工程约定冲突时在说明里写清）。
+- **算法一致、语义一致**；向量源必须用 **RVV**（汇编或 intrinsic，RVV 1.0），不得把汇编问题退化成纯 C 替代。
+- **状态字段同步**：进入该条目时，把 `scan_result.json` 中该条目的 `status` 从 `TODO` 改为 `START`；完成后再改为 `DONE` 并填 `marking`。**不要**在源码里写 `// [MIGRATE-*]` 注释。
+
+### 汇编代码（完整子闭环）
+
+1. 读懂 x86/ARM 语义与边界；设计 RISC-V 寄存器分配、RVV `vl` / mask。
+2. 编写 `*_riscv` 后缀的汇编或 intrinsic 实现。
+3. **遇到指令/扩展/SEW&LMUL/intrinsic 对应/ABI 约束不确定时**：立即进入 2.3 查库，再继续编码。
+
+### 非汇编代码（轻量子流程）
+
+1. **代码适配**：改架构宏/头文件/编译选项使 C/C++ 在 RISC-V 可编译——`#ifdef __x86_64__`/`__ARM_ARCH` 换 `__riscv`；移除 `<immintrin.h>`/`<arm_neon.h>` 等专有头文件；确认字节序/对齐/类型宽度在 RV64（小端、`long`=64-bit）下成立。
+2. 一般不需要进入 2.3 知识库查询（除非出现指令/intrinsic 信号）。
+3. 直接进入 2.4 验证。
+
+### 单元测试细节
 
 - **按需准备环境**：要跑扫描类脚本时，在技能目录执行 `python3 -m pip install -r scripts/requirements.txt`。要编译/运行 **x86_64 或 ARM 原生** 测试时，在技能目录执行 `bash resources/x86_toolchain_env.sh` 或 `bash resources/arm_toolchain_env.sh`，再 **`source resources/env.sh`**（新终端需重做）。若缺系统级依赖（头文件、动态库等），用发行版包管理器补齐。
 - 为迁移点编写或补全 **单元测试**：同一套测试既能编 **原始 x86/ARM**，也能在后续用于 **RISC-V**。
 - 断言可比对结果（返回值、缓冲区、checksum 等）。**无可用测试则不应结束迁移。**
 
-## 第二步：RISC-V 代码迁移
+---
 
-- **按需准备环境**：要编译或本地试编 RISC-V 时，执行 `bash resources/riscv_toolchain_env.sh`，并 **`source resources/env.sh`**。
-- 读懂 x86/ARM 语义与边界；设计 RISC-V（寄存器、RVV `vl`、mask 等），**尽量用向量扩展**对标原向量实现。
-- 新增源文件命名带 **`_riscv`** 后缀（与工程约定冲突时在说明里写清）。
-- **编码规则**：算法一致；向量汇编 → **RVV 汇编**；向量 intrinsic → **RVV 1.0 intrinsic**；标量 → RISC-V 标量汇编可接受。**禁止**为省事把汇编整块改成纯 C（除非用户明确允许）。
+## 阶段二 2.3：知识库/手册查询（汇编条目必走；非汇编条目按需）
 
-## 第三步：执行对比与修复
+**触发条件**：迁移过程中出现任一信号：指令名/扩展名（如 `Zba`/`V`/`Zvbb`）、intrinsic（如 `__riscv_*`）、ABI/CSR/特权字段（如 `mstatus`）。
 
-- **按需准备环境**：用 **`qemu-riscv64`** 等 user-static 跑 RISC-V 二进制前，执行 `bash resources/qemu_static_env.sh`，并 **`source resources/env.sh`**。
-- 分别构建并运行原生与 RISC-V 测试；RISC-V 侧常用 `qemu-riscv64 -cpu max <bin>`（以项目为准）。ARM 侧对比可用 `qemu-aarch64 -cpu max <bin>`。
-- 对比输出；不一致则优先改 RISC-V 侧（或测试/构建脚本）直到一致。
+### 选工具的规则
 
-## 第四步（阶段 E）：llvm-mca 性能分析与改进
+- **`search_core_isa_manuals`**：核心 ISA/汇编/Profile（合并知识库，Milvus spec=`core-isa-manuals`）
+  - 覆盖：`riscv/riscv-isa-manual`、`riscv-non-isa/riscv-asm-manual`、`riscv/riscv-profiles`
+- **`search_rvv_vector_extensions`**：RVV/向量相关扩展与 vector crypto（合并知识库，Milvus spec=`rvv-vector-extensions`）
+  - 覆盖：`riscv-non-isa/riscv-rvv-intrinsic-doc`、`riscv/integer-vector-absolute-difference`、`riscv/riscv-crypto`
+- **`search_special_instructions`**：真正的指令扩展（合并知识库，Milvus spec=`special-instructions`）
+  - 覆盖：`riscv-zabha`、`riscv-zalasr`、`riscv-zaamo-zalrsc`、`riscv-bitmanip`、`riscv-bfloat16`
+- **`search_docs_tools`**：工具/指南/性能与优化（合并知识库，Milvus spec=`docs-tools`）
+  - 覆盖：`riscv-performance-events`、`riscv-optimization-guide`
 
-**适用范围**：条目含 **手写汇编**、**RVV 汇编** 或 **intrinsic 热点循环**，且上文第三步（及项目要求的 QEMU/构建对比）已通过。
+### 调用方式
 
-**目标**：用 `llvm-mca` 对热点段做静态吞吐/瓶颈分析，据此小步优化；**每轮优化后必须重复第三步**（同一组测试、输出一致），禁止只追性能导致语义回归。
+- 列工具确认服务端暴露的工具名：`<skill_root>/scripts/run_query.sh --list-tools`
+- 示例：
+  - `<skill_root>/scripts/run_query.sh -t search_core_isa_manuals -q "mstatus MPP"`
+  - `<skill_root>/scripts/run_query.sh -t search_rvv_vector_extensions -q "__riscv_vsetvl"`
+  - `<skill_root>/scripts/run_query.sh -t search_special_instructions -q "Zba 有哪些指令"`
+  - `<skill_root>/scripts/run_query.sh -t search_docs_tools -q "performance events"`
 
-**完成优化后**：清理临时产物，只保留 **最终** RISC-V 源文件与必要构建改动。
+### 输出要求（证据链）
+
+- **必须**在结论里保留 MCP 返回中的 `file_path` 与 `header_path`（或等价的标题路径信息），作为证据链。
+- 如果返回未包含上述字段：优先让问题更具体（指令名/扩展名/操作数形态/SEW/LMUL），再重查；不要猜。
+
+---
+
+## 阶段二 2.4：执行对比与修复
+
+1. **按需准备环境**：用 **`qemu-riscv64`** 等 user-static 跑 RISC-V 二进制前，执行 `bash resources/qemu_static_env.sh`，并 **`source resources/env.sh`**。
+2. 分别构建并运行原生与 RISC-V 测试；RISC-V 侧常用 `qemu-riscv64 -cpu max <bin>`（以项目为准）。ARM 侧对比可用 `qemu-aarch64 -cpu max <bin>`。
+3. 对比输出；不一致则优先改 RISC-V 侧（或测试/构建脚本）直到一致。
+4. **验证通过后必须更新 JSON 字段**：
+   - 把 `scan_result.json` 中该条目的 `status` 从 `START` 改为 `DONE`
+   - 同时填写 `marking`：
+     - 正常：`无异常，性能与 x86/ARM 实现持平（或给出相对比例）`
+     - 有异常：`语义差异：<具体点>，已通过测试规避` 或 `TODO(后续)：<具体项>`
+     - 性能影响：`性能低于原实现 N%，原因：<…>，建议进入阶段四 llvm-mca 优化`
+
+---
+
+## 阶段三：工程级交叉编译
+
+阶段二所有条目 DONE 后，用 RISC-V 交叉工具链编译整个工程，详见 [SKILL.md](../SKILL.md) 阶段三。
+
+- 在 **Makefile / CMake** 等中增加 riscv64 交叉目标。
+- 修编译错误至通过；缺什么装什么（系统包 + `<skill_root>/resources/*.sh` 已覆盖的工具链/QEMU）。
+- `-march` 覆盖所用扩展；常见起点：`-march=rv64gcv_zbb_zbc_zvbc_zvkb_zvksed -mabi=lp64d`，不够再补。
+- 项目若要求 **静态链接**，遵守之。
+- 若任务固定产物名（如 `riscv64_test`），遵守任务说明。
+- 编译器前缀以 `*_TOOLCHAIN_ROOT/bin` 下实际文件为准（如 `riscv64-unknown-linux-gnu-gcc`、`aarch64-unknown-linux-gnu-gcc`、x86 交叉前缀等）。
+- 用 `qemu-riscv64 -cpu max <bin>` 跑主流程/集成测试，至少确认主程序可启动、无立即崩溃、关键路径输出与 x86/ARM 侧一致。
+
+---
+
+## 阶段四：llvm-mca 性能分析与改进（独立 agent）
+
+**触发条件**：阶段一/二/三全部完成；存在手写汇编 / RVV 汇编 / intrinsic 热点循环；或阶段二 `marking` 字段明确标注「建议进入阶段四 llvm-mca 优化」。
+
+**目标**：用 `llvm-mca` 对热点段做静态吞吐/瓶颈分析，据此小步优化；**每轮优化后必须重复 2.4**（同一组测试、输出一致），禁止只追性能导致语义回归。
+
+**完成优化后**：清理临时产物，只保留 **最终** RISC-V 源文件与必要构建改动。**必须**回到 `scan_result.json` 对应条目的 `marking` 字段改为 `经阶段四 llvm-mca 优化后性能 <提升 N%>；关键改动：<具体点>`。
+
+**独立 agent 说明**：本阶段由 `riscv-asm-analyzer` agent 负责，不在阶段二主流程内嵌运行；召唤时机由主 agent 根据 `marking` 字段决定。
 
 ### 宿主与目标分工
 
@@ -62,7 +151,7 @@ python3 scripts/query.py -t search_rvv_vector_extensions -q "__riscv_vsetvl"
 
 ### 交叉编译：如何得到 `hot.s`
 
-- **不要用宿主默认 `clang`** 冒充 RISC-V，除非工程本就如此构建。应使用阶段 D / `resources/riscv_toolchain_env.sh` 提供的 **`riscv64-*-clang`**（或项目指定的交叉编译器），并带上与 **Makefile / CMake** 完全一致的优化级别与机器选项，例如：
+- **不要用宿主默认 `clang`** 冒充 RISC-V，除非工程本就如此构建。应使用阶段二 2.4 验证环境 / `resources/riscv_toolchain_env.sh` 提供的 **`riscv64-*-clang`**（或项目指定的交叉编译器），并带上与 **Makefile / CMake** 完全一致的优化级别与机器选项，例如：
   - `<RISCV_CLANG> -O3 -S -march=… -mabi=… -mcmodel=…（及其它与正式编译相同的 flag）-o hot.s hot.c`
 - 若已有目标文件，也可用 `llvm-objdump -d` 截取循环片段再分析；注意 `llvm-mca` 对 **LLVM 汇编语法** 最友好，反汇编文本可能需要手工整理成可解析片段。
 - **手写迁移后的 `.S/.s`**：可直接作为输入，只要指令集与工程 `-march` 一致。
@@ -82,7 +171,7 @@ python3 scripts/query.py -t search_rvv_vector_extensions -q "__riscv_vsetvl"
 
 | `-mcpu` 值　　　| 微架构类型　　 | 发射宽度 | 适用场景　　　　　　　　　　　　　　 |
 | -----------------| ----------------| ----------| --------------------------------------|
-| **`zhufeng2`**　| **六发射乱序** | **6**　　| **自研朱峰2号芯片**　　　　　　　　　|
+| **`zhufeng2`**　| **六发射乱序** | **6**　　| **自研朱峰2号芯片**（**默认**）　　　|
 | `rocket-rv64`　 | 单发射顺序　　 | 1　　　　| 资源极度受限的嵌入式场景　　　　　　 |
 | `sifive-u74`　　| 双发射顺序　　 | 2　　　　| 顺序核基线评估（SiFive U74 / FU740） |
 | `andes-ax45mpv` | 多核顺序　　　 | 1　　　　| Andes AX45MPV 平台　　　　　　　　　 |
@@ -174,23 +263,65 @@ llvm-mca -mtriple=riscv64 -mcpu=sifive-p450 -mattr=+v \
 - IPC 达到 Dispatch Width 的 **70% 以上**。
 - Block RThroughput 不再随优化显著下降（连续两轮差距 < 5%）。
 - `No resource or data dependency bottlenecks` 出现。
-- 每次优化后必须回到第三步验证正确性，正确性不可妥协。
+- 每次优化后必须回到 2.4 验证正确性，正确性不可妥协。
 
 ### 闭环产出（必须）
 
 - **性能**：每轮保留 `llvm-mca` 输出中的关键摘要（吞吐、周期估计、瓶颈提示等），便于与上一轮对比。
-- **正确性**：每轮修改后重复第三步（构建 + QEMU/对比测试），输出不一致则先修语义再继续调性能。
+- **正确性**：每轮修改后重复 2.4（构建 + QEMU/对比测试），输出不一致则先修语义再继续调性能。
+- **NOTE 更新**：优化通过后必须回到 `scan_result.json` 对应条目的 `marking` 字段标注优化效果。
 
-## 编译与链接（约定，可按项目改）
-
-1. 在 **Makefile / CMake** 等中增加 riscv64 交叉目标。
-2. 修编译错误至通过；缺什么装什么（系统包 + 上列 `resources/*.sh` 已覆盖的工具链/QEMU）。
-3. `-march` 覆盖所用扩展；常见起点：`-march=rv64gcv_zbb_zbc_zvbc_zvkb_zvksed -mabi=lp64d`，不够再补。
-4. 项目若要求 **静态链接**，遵守之。
-5. 若任务固定产物名（如 `riscv64_test`），遵守任务说明。
-
-编译器前缀以 `*_TOOLCHAIN_ROOT/bin` 下实际文件为准（如 `riscv64-unknown-linux-gnu-gcc`、`aarch64-unknown-linux-gnu-gcc`、x86 交叉前缀等）。
+---
 
 ## 完成说明
 
-向用户简短总结：处理了哪些条目、改了哪些文件、测试与对比命令及结果。若做过第四步，附带 **llvm-mca 前后对比要点** 与回归测试结论。除非用户要固定模板，否则不必单独写 `output.md`。
+向用户简短总结：处理了哪些条目、改了哪些文件、测试与对比命令及结果。若做过阶段四，附带 **llvm-mca 前后对比要点** 与回归测试结论。除非用户要固定模板，否则不必单独写 `output.md`。
+
+---
+
+## 迁移点状态字段规范（status / marking）
+
+每个条目在 `scan_result.json` 中通过 `status` 与 `marking` 两个结构化字段维护进度。**权威源在 JSON，不在源码**。三态**互斥**（同一时刻只能有一个）；`status=DONE` 时 `marking` 必填。
+
+```jsonc
+// 阶段一扫描产出（默认状态）：
+{
+  "file_path": "/abs/path/src/crc/crc32.c",
+  "start_line": 120,
+  "end_line": 200,
+  "solver_type": "InlineAsm",
+  "status": "TODO",
+  "marking": ""
+}
+
+// 阶段二 2.2 进入条目时：
+{ "status": "START", "marking": "" }
+
+// 阶段二 2.4 验证通过时：
+{
+  "status": "DONE",
+  "marking": "无异常，性能与 SSE 实现持平；建议进入阶段四用 llvm-mca 确认吞吐"
+}
+
+// 阶段四优化通过后（更新 marking）：
+{
+  "status": "DONE",
+  "marking": "经阶段四 llvm-mca 优化后 IPC 由 2.1 提升到 5.4（zhufeng2），关键改动：vsetvli 外提 + 多累加器拆分"
+}
+```
+
+| `status` | 含义 | 何时设置 | `marking` 是否必填 |
+| ------- | ---- | -------- | ----------------- |
+| `TODO` | 未处理 | 阶段一扫描产出（默认值） | 否 |
+| `START` | 开始迁移 | 阶段二 2.2 进入该条目 | 否 |
+| `DONE` | 迁移完成 | 阶段二 2.4 验证通过 | **是** |
+
+`marking` 常见内容：
+
+- 无异常：`无异常，性能持平`
+- 语义差异：`语义差异：<具体点>，已通过测试规避`
+- 性能下降：`性能低于原实现 N%，原因：<…>，建议进入阶段四 llvm-mca 优化`
+- 阶段四优化后：`经阶段四 llvm-mca 优化后 IPC 由 <x> 提升到 <y>（<cpu>），关键改动：<具体点>`
+- 需要后续修复：`TODO(后续)：<具体项>`
+
+更新方式：直接编辑 JSON 文件（或 agent 用 `jq`/Python 改写条目），写回后必须保持 schema 与缩进一致。**不要**在源码里写 `MIGRATE-*` 注释。

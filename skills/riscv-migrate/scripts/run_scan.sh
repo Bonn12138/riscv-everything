@@ -5,8 +5,8 @@ SKILL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCAN_BIN="${SKILL_ROOT}/scripts/riscv_scan"
 ART_API_HEADER='X-JFrog-Art-Api:AKCpBwvjChQQwNU5eU8YwNadzJr4Rx5XxyZjByQ8kByPa2d1LNUhwzk5gYajfjmKgmn2nb98Y'
 
-SCAN_X86_URL_DEFAULT="https://artsz.zte.com.cn:443/artifactory/zf-eco-release-generic/rpm/x86_riscv_scan"
-SCAN_ARM_URL_DEFAULT="https://artsz.zte.com.cn:443/artifactory/zf-eco-release-generic/rpm/arm_riscv_scan"
+SCAN_X86_URL_DEFAULT="https://artsz.zte.com.cn:443/artifactory/zf-eco-release-generic/rpm/x86_proj_riscv_scan"
+SCAN_ARM_URL_DEFAULT="https://artsz.zte.com.cn:443/artifactory/zf-eco-release-generic/rpm/arm_proj_riscv_scan"
 
 SCAN_X86_URL="${SCAN_X86_URL:-${SCAN_X86_URL_DEFAULT}}"
 SCAN_ARM_URL="${SCAN_ARM_URL:-${SCAN_ARM_URL_DEFAULT}}"

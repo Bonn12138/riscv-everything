@@ -9,7 +9,7 @@ log "RISC-V cross toolchain"
 require_cmd curl
 
 archive="${TOOLCHAIN_DIR}/riscv-toolchain.tar.xz"
-RISCV_TOOLCHAIN_URL="https://artsz.zte.com.cn:443/artifactory/zf-eco-release-generic/rpm/riscv64_gcc14.1.0_glibc2.39.0_fp.tar.bz2"
+RISCV_TOOLCHAIN_URL="https://artsz.zte.com.cn:443/artifactory/zf-eco-release-generic/rpm/riscv64_gcc14.3.0_glibc2.38.0_fp.tar.bz2"
 
 if [[ -f "${archive}" ]]; then
   log "已存在，跳过下载: ${archive}"

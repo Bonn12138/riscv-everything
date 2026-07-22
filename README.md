@@ -6,9 +6,8 @@ RISC-V 全栈迁移工具链 Claude Code 插件。面向 x86/ARM 代码库，提
 
 本插件围绕一个核心技能 `riscv-migrate` 构建，配套：
 
-- **7 条斜杠命令** — 3 条单 agent 流程（扫描 / 迁移 / 验证）+ 4 条多智能体 swarm 命令（classify / migrate / verify / mca，见下文「批量并行模式」）
+- **3 条斜杠命令** — 快速启动扫描 / 迁移 / 验证流程
 - **2 个专用智能体** — 迁移代码审查 + 汇编热点分析
-- **多智能体 workflow 编排** — 大规模迁移（50+ 条目）时按文件/tier 并行 + 对抗式 2 票审查 + 循环收敛（`-swarm` 命令）
 - **远端知识库查询** — 通过技能内置脚本连接远端 RISC-V 文档 MCP 服务，查询 ISA / RVV 文档，**无需本地部署服务端**
 
 ## 技能
@@ -17,17 +16,18 @@ RISC-V 全栈迁移工具链 Claude Code 插件。面向 x86/ARM 代码库，提
 
 > 详情见 `skills/riscv-migrate/SKILL.md`
 
-扫描 x86/ARM 代码库并迁移到 RISC-V（含 RVV），实现五阶段闭环：
+扫描 x86/ARM 代码库并迁移到 RISC-V（含 RVV），按**三大阶段**推进，性能分析作为独立 agent 仅在迁移完成后启动：
 
 | 阶段 | 说明 |
 |---|---|
-| A — 扫描 | 盘点待迁移点，产出 `scan_result.json` |
-| B — 迁移 | 逐条目改代码，主动查知识库补齐证据 |
-| C — 知识库 | 连接远端 MCP 服务，查询指令 / 扩展 / intrinsic / CSR 对应关系 |
-| D — 验证 | 自动准备工具链与 QEMU，做输出对比 |
-| E — 性能 | llvm-mca 静态分析吞吐 / 瓶颈并优化 |
+| **一 — 扫描** | 盘点待迁移点，产出 `scan_result.json` |
+| **二 — 按条目分流迁移** | 每个条目严格串行 `分流 → 迁移 → 知识库 → 验证`，通过改写 `scan_result.json` 的 `status` / `marking` 字段同步进度（`TODO → START → DONE + marking`） |
+| **三 — 工程级交叉编译** | 用 RISC-V 交叉工具链编译整个工程，修编译错误，产出可在 QEMU 跑通的 RV 可执行程序 |
+| **四 — 性能分析（独立 agent）** | 仅在阶段三通过后召唤 `riscv-asm-analyzer`，对热点用 `llvm-mca` 分析并迭代优化 |
 
-各阶段可独立运行，也可自动串联。
+各阶段串行执行；二全部条目 DONE 后才能进入三；三通过后才召唤四。
+
+> **零交互自主运行**：技能/命令执行期间默认不向用户提问，所有决策按 `skills/riscv-migrate/SKILL.md`「自主运行原则」默认处理；只有 5 类白名单场景（找不到工程根 / 条目级 5 轮不一致 / 编译连错 3 次 / 内网不通 / 用户主动问）才请示。
 
 ## 命令
 
@@ -39,33 +39,16 @@ RISC-V 全栈迁移工具链 Claude Code 插件。面向 x86/ARM 代码库，提
 | `/everything-riscv:migrate` | 启动迁移流程（按条目逐项迁移） |
 | `/everything-riscv:verify` | 触发 QEMU 验证：自动准备工具链 → 编译 → 输出对比 → 回流修复 |
 
-## 批量并行模式（workflow）
-
-大规模迁移（50+ 条目）时，用多智能体 workflow 命令替代单 agent 串行流程。每条 `-swarm` 命令启动一个 workflow 脚本（`skills/riscv-migrate/workflows/*.workflow.js`），按文件 / tier 并行 + 对抗式 2 票审查 + 循环收敛：
-
-| 命令 | workflow | 作用 |
-|---|---|---|
-| `/everything-riscv:classify-swarm` | `classify.workflow.js` | 批量预分流，产出 `classified.json` + 初始化 `progress.json` |
-| `/everything-riscv:migrate-swarm` | `migrate-batch.workflow.js` | 按 tier 分批并行迁移 + 2 票 review + 修复（支持断点续传） |
-| `/everything-riscv:verify-swarm` | `verify-swarm.workflow.js` | QEMU 对比 baseline 循环收敛，修真发散 |
-| `/everything-riscv:mca-swarm` | `mca-analyze.workflow.js` | 对 `asm_hotspot` 并行 llvm-mca 分析 + 迭代优化 |
-
-典型串联：`scan → classify-swarm → migrate-swarm → verify-swarm → mca-swarm`。
-
-- 进度落在 `<target>/.riscv_migrate/progress.json`，自动跳过已 `done` 条目，可随时重跑续传。
-- 每次发起 workflow 需用户授权（opt-in），属预期行为。
-- 设计约定（参数化、HARD RULES、anti-reward-hack、并发聚合）见 `skills/riscv-migrate/referens/workflow_patterns.md`，技能内说明见 `SKILL.md` 阶段 F。
-
 ## 智能体
 
 | 智能体 | 用途 |
 |---|---|
 | `riscv-code-reviewer` | 审查迁移后的 RISC-V 代码：向量化正确性、ABI 约定、内存对齐、指令选择 |
-| `riscv-asm-analyzer` | 对热点汇编做 llvm-mca 静态分析，给出吞吐瓶颈与优化建议 |
+| `riscv-asm-analyzer` | 阶段四独立 agent：对热点汇编做 llvm-mca 静态分析，给出吞吐瓶颈与优化建议；每轮优化后回到阶段二 2.4 验证 |
 
 ## 知识库（远端）
 
-技能的 **阶段 C** 通过内置脚本 `skills/riscv-migrate/scripts/run_query.sh` 连接一个**已部署的远端 RISC-V 文档 MCP 服务**（HTTP / Streamable HTTP），查询 ISA 手册、RVV 向量扩展、专项指令、性能优化文档。
+技能的**阶段二 2.3** 通过内置脚本 `skills/riscv-migrate/scripts/run_query.sh` 连接一个**已部署的远端 RISC-V 文档 MCP 服务**（HTTP / Streamable HTTP），查询 ISA 手册、RVV 向量扩展、专项指令、性能优化文档。
 
 - 默认端点：`http://10.2.71.145:12306/mcp`（内网），可用环境变量 `RISCV_DOC_MCP_URL` 覆盖。
 - 暴露工具：`search_core_isa_manuals` / `search_rvv_vector_extensions` / `search_special_instructions` / `search_docs_tools`。
@@ -138,9 +121,10 @@ RISC-V 全栈迁移工具链 Claude Code 插件。面向 x86/ARM 代码库，提
 
 > 若修改了插件源码，可执行 `/plugin marketplace update everything-riscv` 刷新，或重启 Claude Code 会话使其重新加载。如加载异常，用 `claude --debug` 启动查看插件加载日志。
 
-### 关于 `source: "."` 的说明
+## langfuse 监控平台
 
-本插件采用「插件根即 marketplace 根」的单插件布局，`marketplace.json` 中 `"source": "."` 指向自身。绝大多数 Claude Code 版本可正确识别；若你的版本不识别 `source: "."`，可改用子目录布局（将 `skills/` `commands/` `agents/` `.claude-plugin/` 移入一个子目录，并将 `source` 改为该子目录相对路径，如 `"./everything-riscv"`）。
+  - 本插件带有自动上传相关riscv迁移相关对话的hook脚本 hooks/langfuse_hook.py。
+  - 在脚本中内置了langfuse平台的上传凭证，无需配置，安装插件即可使用
 
 ## 目录结构
 
@@ -155,12 +139,12 @@ everything-riscv/
 │   └── riscv-migrate/          # 核心技能
 │       ├── SKILL.md
 │       ├── scripts/            # 扫描 / 知识库查询 / 验证环境准备脚本
-│       ├── workflows/          # 多智能体 workflow 编排脚本（*-swarm 命令发起）
-│       ├── referens/           # 迁移 / 扫描 / workflow 设计细则
+│       ├── referens/           # 迁移与扫描细则
 │       └── resources/          # 工具链 / QEMU / llvm-mca 环境部署脚本
 ├── commands/                   # 斜杠命令（/everything-riscv:<name>）
-│   ├── scan.md / migrate.md / verify.md          # 单 agent 流程
-│   └── *-swarm.md (×4)                           # 多智能体 workflow（classify/migrate/verify/mca）
+│   ├── scan.md
+│   ├── migrate.md
+│   └── verify.md
 └── agents/                     # 专用智能体
     ├── riscv-code-reviewer.md
     └── riscv-asm-analyzer.md
@@ -169,8 +153,8 @@ everything-riscv/
 ## 依赖
 
 - **扫描 / 迁移**：Bash（扫描引擎二进制由 `scripts/run_scan.sh` 首次从内网 Artifactory 下载；知识库查询由 `scripts/run_query.sh` 自举 Python 依赖，无需 venv）。
-- **编译验证**：RISC-V GCC 工具链（`riscv64-unknown-linux-gnu-gcc`）+ QEMU user mode（由 `resources/*_toolchain_env.sh` 在阶段 D 自动部署与加载）。
-- **性能分析**：LLVM 工具链（`llvm-mca`，由 `resources/llvm_mca_env.sh` 在阶段 E 自动部署）。
+- **编译验证**：RISC-V GCC 工具链（`riscv64-unknown-linux-gnu-gcc`）+ QEMU user mode（由 `resources/*_toolchain_env.sh` 在阶段二 2.4 / 阶段三自动部署与加载）。
+- **性能分析**：LLVM 工具链（`llvm-mca`，由 `resources/llvm_mca_env.sh` 在阶段四自动部署）。
 - **知识库查询**：Python 3（`mcp` + `httpx`，已列入 `scripts/requirements-mcp.txt`，由 `run_query.sh` 自动安装）。
 
 ## 许可证
