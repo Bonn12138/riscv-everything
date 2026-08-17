@@ -1,14 +1,41 @@
 # everything-riscv
 
-RISC-V 全栈迁移工具链 Claude Code 插件。面向 x86/ARM 代码库，提供从工程扫描到迁移验证再到性能优化的完整闭环。
+> RISC-V 全栈迁移工具链 Claude Code 插件。采用「主 Agent 编排 + 阶段内动态 Subagent」架构，面向 x86/ARM 代码库，提供从工程扫描到迁移验证再到性能优化的完整闭环。
 
 ## 概述
 
-本插件围绕一个核心技能 `riscv-migrate` 构建，配套：
+本插件围绕一个核心技能 `riscv-migrate` 构建，采用**主 Agent 编排 + 阶段内动态 Subagent**模式：
 
-- **3 条斜杠命令** — 快速启动扫描 / 迁移 / 验证流程
-- **2 个专用智能体** — 迁移代码审查 + 汇编热点分析
+- 主 Agent 是唯一编排者与状态提交者，独占 `scan_result.json` 写入权
+- Subagent 承担阶段内工作单元（扫描、规划、迁移、审查、诊断、分析）
+- **3 条斜杠命令** — 快速启动扫描 / 迁移 / 验证流程，每条命令适配 Subagent 编排
+- **6 个专用 Subagent** — 扫描 Worker、迁移规划者、迁移 Worker、代码审查者、构建诊断者、热点分析者
 - **远端知识库查询** — 通过技能内置脚本连接远端 RISC-V 文档 MCP 服务，查询 ISA / RVV 文档，**无需本地部署服务端**
+
+## 架构
+
+```text
+主 Agent（唯一编排者和状态提交者）
+  │
+  ├─ 阶段一：riscv-scan-worker × N（只读并行扫描）
+  │            └─ 主 Agent 合并、去重并生成 scan_result.json
+  │
+  ├─ 阶段二：riscv-migration-planner（先产出互不重叠任务分组，主 Agent 审核）
+  │            └─ riscv-migration-worker × N（按分组可并行）
+  │                 ├─ 必要性分析（误报直接返回 NO_WORK_NEEDED）
+  │                 ├─ 普通架构适配
+  │                 ├─ RVV intrinsic 迁移
+  │                 ├─ inline/standalone asm 迁移
+  │                 └─ riscv-code-reviewer（汇编/RVV 条目门禁）
+  │
+  ├─ 阶段三：riscv-build-diagnoser × N（只读并行诊断）
+  │            └─ 主 Agent 或单个写入型 Subagent 串行修复
+  │
+  └─ 阶段四：riscv-asm-analyzer × N（多热点并行分析）
+                └─ riscv-code-reviewer（优化复核）
+```
+
+> **核心约束**：`scan_result.json` 只能由主 Agent 写入。Subagent 成功不代表条目 DONE——只有主 Agent 完成最终 QEMU 验证后才能更新状态。
 
 ## 技能
 
@@ -16,35 +43,50 @@ RISC-V 全栈迁移工具链 Claude Code 插件。面向 x86/ARM 代码库，提
 
 > 详情见 `skills/riscv-migrate/SKILL.md`
 
-扫描 x86/ARM 代码库并迁移到 RISC-V（含 RVV），按**三大阶段**推进，性能分析作为独立 agent 仅在迁移完成后启动：
+x86/ARM → RISC-V（含 RVV）一体化迁移技能，按**四大阶段**推进：
 
-| 阶段 | 说明 |
-|---|---|
-| **一 — 扫描** | 盘点待迁移点，产出 `scan_result.json` |
-| **二 — 按条目分流迁移** | 每个条目严格串行 `分流 → 迁移 → 知识库 → 验证`，通过改写 `scan_result.json` 的 `status` / `marking` 字段同步进度（`TODO → START → DONE + marking`） |
-| **三 — 工程级交叉编译** | 用 RISC-V 交叉工具链编译整个工程，修编译错误，产出可在 QEMU 跑通的 RV 可执行程序 |
-| **四 — 性能分析（独立 agent）** | 仅在阶段三通过后召唤 `riscv-asm-analyzer`，对热点用 `llvm-mca` 分析并迭代优化 |
+| 阶段 | 说明 | 执行模式 |
+| ---- | ---- | -------- |
+| **一 — 扫描** | 盘点待迁移点，产出 `scan_result.json` | 基础扫描器 + 可选并行扫描 Subagent → 主 Agent 合并去重 |
+| **二 — 按条目分流迁移** | 每个条目 `分流 → 迁移 → 知识库 → 验证`，通过改写 `scan_result.json` 的 `status` / `marking` 字段同步进度 | 依赖分组后独立条目可并行；汇编/RVV 条目必过 Reviewer 门禁 |
+| **三 — 工程级交叉编译** | 用 RISC-V 交叉工具链编译整个工程，修编译错误，产出可在 QEMU 跑通的 RV 可执行程序 | 并行诊断 + 串行修复 |
+| **四 — 性能分析（独立 Subagent）** | 仅在阶段三通过后召唤 `riscv-asm-analyzer`，对热点用 `llvm-mca` 分析并迭代优化 | 多热点并行分析；主 Agent 统一实施、验收与回写 |
 
-各阶段串行执行；二全部条目 DONE 后才能进入三；三通过后才召唤四。
+阶段门禁不变（一→二→三→四严格串行）；阶段内按工作量动态调用 Subagent。
 
-> **零交互自主运行**：技能/命令执行期间默认不向用户提问，所有决策按 `skills/riscv-migrate/SKILL.md`「自主运行原则」默认处理；只有 5 类白名单场景（找不到工程根 / 条目级 5 轮不一致 / 编译连错 3 次 / 内网不通 / 用户主动问）才请示。
+> **零交互自主运行**：技能/命令执行期间默认不向用户提问，所有决策按 `skills/riscv-migrate/SKILL.md`「自主运行原则」默认处理；只有 5 类白名单场景（找不到工程根 / 条目级 5 轮不一致 / 编译连错 3 次 / 内网不通 / 用户主动问）才请示。Subagent 不得直接向用户提问。
 
 ## 命令
 
 插件命令以 `everything-riscv` 为命名空间调用（即 `/everything-riscv:<命令>`）：
 
 | 命令 | 用途 |
-|---|---|
-| `/everything-riscv:scan` | 扫描工程，生成待迁移点清单 |
-| `/everything-riscv:migrate` | 启动迁移流程（按条目逐项迁移） |
-| `/everything-riscv:verify` | 触发 QEMU 验证：自动准备工具链 → 编译 → 输出对比 → 回流修复 |
+| ---- | ---- |
+| `/everything-riscv:scan` | 扫描工程，生成待迁移点清单（基础扫描 + 可选并行 scan-worker） |
+| `/everything-riscv:migrate` | 启动迁移流程（依赖分组后独立条目可并行；汇编条目必过 Reviewer） |
+| `/everything-riscv:verify` | 触发 QEMU 验证：自动准备工具链 → 编译 → 输出对比 → 主 Agent 回流修复与状态提交 |
 
-## 智能体
+## Subagent
 
-| 智能体 | 用途 |
-|---|---|
-| `riscv-code-reviewer` | 审查迁移后的 RISC-V 代码：向量化正确性、ABI 约定、内存对齐、指令选择 |
-| `riscv-asm-analyzer` | 阶段四独立 agent：对热点汇编做 llvm-mca 静态分析，给出吞吐瓶颈与优化建议；每轮优化后回到阶段二 2.4 验证 |
+| Subagent | 角色 | 读写属性 | 触发阶段 |
+| -------- | ---- | -------- | -------- |
+| `riscv-scan-worker` | 按目录/扫描维度返回候选迁移点 | 只读 | 阶段一（补充扫描） |
+| `riscv-migration-worker` | 执行分配迁移条目（分流、迁移、查库） | 写入（指定文件范围内） | 阶段二 |
+| `riscv-code-reviewer` | 审查汇编/RVV 迁移代码：向量化正确性、ABI 约定、内存对齐、指令选择 | 只读 | 阶段二（汇编/RVV 条目门禁）、阶段四（优化复核） |
+| `riscv-build-diagnoser` | 分析工程级完整构建日志，按根因聚类编译错误 | 只读 | 阶段三（编译失败诊断） |
+| `riscv-asm-analyzer` | 对热点汇编做 llvm-mca 静态性能分析，输出吞吐瓶颈与优化建议 | 可读写（热点级绑定，不写 JSON） | 阶段四 |
+
+## 状态字段规范
+
+每个迁移点的状态以 `scan_result.json` 中的结构化字段维护（**权威源在 JSON，不在源码注释；只有主 Agent 可以写入**）：
+
+```text
+主 Agent: TODO → START         （分派任务前）
+Subagent: 返回 READY_FOR_REVIEW / READY_FOR_VERIFY
+Reviewer: 返回 PASS / NEEDS_FIX / FAIL
+主 Agent: 运行 QEMU 验证
+主 Agent: START → DONE + marking（验证通过后）
+```
 
 ## 知识库（远端）
 
@@ -53,15 +95,6 @@ RISC-V 全栈迁移工具链 Claude Code 插件。面向 x86/ARM 代码库，提
 - 默认端点：`http://10.2.71.145:12306/mcp`（内网），可用环境变量 `RISCV_DOC_MCP_URL` 覆盖。
 - 暴露工具：`search_core_isa_manuals` / `search_rvv_vector_extensions` / `search_special_instructions` / `search_docs_tools`。
 - **无需本地部署服务端、无需 Milvus / 向量 / 重排模型**：本插件只含 MCP 客户端（`scripts/query.py`），服务端由团队统一维护。
-- 查询示例：
-
-  ```bash
-  # 列出远端服务暴露的工具
-  bash skills/riscv-migrate/scripts/run_query.sh --list-tools
-  # 查询某条指令 / 扩展
-  bash skills/riscv-migrate/scripts/run_query.sh -t search_core_isa_manuals -q "mstatus MPP"
-  bash skills/riscv-migrate/scripts/run_query.sh -t search_rvv_vector_extensions -q "__riscv_vsetvl"
-  ```
 
 ## 安装部署
 
@@ -87,24 +120,14 @@ RISC-V 全栈迁移工具链 Claude Code 插件。面向 x86/ARM 代码库，提
 /plugin list
 ```
 
-安装后插件会被复制到 `~/.claude/plugins/cache/everything-riscv/everything-riscv/<version>/`，以**用户级（user scope）**生效——所有项目均可使用 `/everything-riscv:*` 命令、`riscv-migrate` 技能与两个子代理。
+安装后插件会被复制到 `~/.claude/plugins/cache/everything-riscv/everything-riscv/<version>/`，以**用户级（user scope）**生效——所有项目均可使用 `/everything-riscv:*` 命令、`riscv-migrate` 技能与 Subagent。
 
 ### 配置（按需）
 
 | 配置项 | 说明 |
-|---|---|
+| ------ | ---- |
 | `RISCV_DOC_MCP_URL` | 远端知识库 MCP 端点；不设则用默认内网地址 `http://10.2.71.145:12306/mcp`。若你的端点不同，在 `~/.claude/settings.json` 的 `env` 段或 shell `export` 注入。 |
 | 内网可达性 | 扫描引擎（`scripts/run_scan.sh` 首次从内网 Artifactory 下载）与远端知识库服务均需内网访问。 |
-
-`~/.claude/settings.json` 示例（可选）：
-
-```json
-{
-  "env": {
-    "RISCV_DOC_MCP_URL": "http://10.2.71.145:12306/mcp"
-  }
-}
-```
 
 ### 更新与卸载
 
@@ -119,12 +142,10 @@ RISC-V 全栈迁移工具链 Claude Code 插件。面向 x86/ARM 代码库，提
 /plugin marketplace remove everything-riscv
 ```
 
-> 若修改了插件源码，可执行 `/plugin marketplace update everything-riscv` 刷新，或重启 Claude Code 会话使其重新加载。如加载异常，用 `claude --debug` 启动查看插件加载日志。
-
 ## langfuse 监控平台
 
-  - 本插件带有自动上传相关riscv迁移相关对话的hook脚本 hooks/langfuse_hook.py。
-  - 在脚本中内置了langfuse平台的上传凭证，无需配置，安装插件即可使用
+- 本插件带有自动上传相关 riscv 迁移相关对话的 hook 脚本 `hooks/langfuse_hook.py`。
+- 在脚本中内置了 langfuse 平台的上传凭证，无需配置，安装插件即可使用。
 
 ## 目录结构
 
@@ -135,28 +156,27 @@ everything-riscv/
 │   └── marketplace.json        # 本地 marketplace 声明（source 指向自身）
 ├── README.md
 ├── LICENSE
-├── skills/
-│   └── riscv-migrate/          # 核心技能
-│       ├── SKILL.md
-│       ├── scripts/            # 扫描 / 知识库查询 / 验证环境准备脚本
-│       ├── referens/           # 迁移与扫描细则
-│       └── resources/          # 工具链 / QEMU / llvm-mca 环境部署脚本
-├── commands/                   # 斜杠命令（/everything-riscv:<name>）
+├── agents/                     # Subagent 定义
+│   ├── riscv-scan-worker.md    # 阶段一：只读扫描
+│   ├── riscv-migration-worker.md # 阶段二：迁移执行
+│   ├── riscv-code-reviewer.md  # 阶段二/四：只读审查
+│   ├── riscv-build-diagnoser.md # 阶段三：只读编译诊断
+│   └── riscv-asm-analyzer.md   # 阶段四：热点性能分析
+├── commands/                   # 斜杠命令
 │   ├── scan.md
 │   ├── migrate.md
 │   └── verify.md
-└── agents/                     # 专用智能体
-    ├── riscv-code-reviewer.md
-    └── riscv-asm-analyzer.md
+├── hooks/
+│   ├── hooks.json
+│   └── langfuse_hook.py
+└── skills/
+    └── riscv-migrate/          # 核心技能
+        ├── SKILL.md
+        ├── README.md
+        ├── referens/           # 参考文档（Schema、迁移方法、Subagent 调度设计）
+        │   ├── project_scan.md
+        │   ├── code_migrate.md
+        │   └── subagent-orchestration-design.md
+        ├── resources/          # 环境脚本（工具链/QEMU/llvm-mca）
+        └── scripts/            # 扫描 / 知识库查询 / 验证环境准备
 ```
-
-## 依赖
-
-- **扫描 / 迁移**：Bash（扫描引擎二进制由 `scripts/run_scan.sh` 首次从内网 Artifactory 下载；知识库查询由 `scripts/run_query.sh` 自举 Python 依赖，无需 venv）。
-- **编译验证**：RISC-V GCC 工具链（`riscv64-unknown-linux-gnu-gcc`）+ QEMU user mode（由 `resources/*_toolchain_env.sh` 在阶段二 2.4 / 阶段三自动部署与加载）。
-- **性能分析**：LLVM 工具链（`llvm-mca`，由 `resources/llvm_mca_env.sh` 在阶段四自动部署）。
-- **知识库查询**：Python 3（`mcp` + `httpx`，已列入 `scripts/requirements-mcp.txt`，由 `run_query.sh` 自动安装）。
-
-## 许可证
-
-见 [LICENSE](./LICENSE)

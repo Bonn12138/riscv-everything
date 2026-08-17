@@ -1,5 +1,5 @@
 ---
-description: 触发迁移验证：阶段二 2.4（条目级 QEMU 对比）+ 阶段三产物级 QEMU 验证；自动准备工具链与 QEMU → 编译 → 逐字节比对输出，定位不一致并回流修复
+description: 触发迁移验证：阶段二 2.4（条目级 QEMU 对比）+ 阶段三产物级 QEMU 验证；自动准备工具链与 QEMU → 编译 → 逐字节比对输出，定位不一致并回流修复。QEMU 验证必须由主 Agent 执行，验证通过后主 Agent 更新 scan_result.json。
 argument-hint: [source-dir | riscv-src]
 ---
 
@@ -7,14 +7,16 @@ argument-hint: [source-dir | riscv-src]
 
 准备 RISC-V 工具链与 QEMU（由技能自动部署、自动加载），对迁移后的代码编译并在 `qemu-riscv64` 下运行，与原始 x86/ARM 实现做输出 / 校验和对比，定位不一致并回流到迁移流程修复。
 
-## 在三大阶段中的位置
+> **QEMU 验证必须由主 Agent 执行**，不能委托给 Subagent。Subagent 只能返回局部编译结果和 `READY_FOR_REVIEW` / `READY_FOR_VERIFY`；只有主 Agent 完成 QEMU 对比后才能将条目写为 `DONE`。
+
+## 在四大阶段中的位置
 
 验证在两个阶段发生，**作用域不同**：
 
-| 触发场景 | 所属阶段 | 验证范围 |
-| -------- | -------- | -------- |
-| **阶段二 2.4** | 每个迁移条目 `status` 改为 `DONE` 之前 | 单个迁移点：原始 vs RISC-V 条目级测试，行为一致即在 JSON 中写 `status="DONE"` + `marking` |
-| **阶段三 3.3** | 工程级编译之后 | 整体产物：`qemu-riscv64 -cpu max <bin>` 跑主流程，至少能启动、关键路径输出与 x86/ARM 侧一致 |
+| 触发场景 | 所属阶段 | 验证范围 | 执行者 |
+| -------- | -------- | -------- | ------ |
+| **阶段二 2.4** | 每个迁移条目 `status` 改为 `DONE` 之前 | 单个迁移点：原始 vs RISC-V 条目级测试，行为一致后主 Agent 在 JSON 中写 `status="DONE"` + `marking` | **主 Agent** |
+| **阶段三 3.3** | 工程级编译之后 | 整体产物：`qemu-riscv64 -cpu max <bin>` 跑主流程，至少能启动、关键路径输出与 x86/ARM 侧一致 | **主 Agent** |
 
 > **条目级 + 产物级互补**：条目级保证单个迁移点正确；产物级保证整体可运行。
 
@@ -50,9 +52,9 @@ diff ref.txt riscv.txt
 
 若用户提供了测试规格（输入向量、预期输出），按规格构造用例逐条运行对比。
 
-### 3. 阶段二 2.4 验证通过后的 JSON 字段更新（必须）
+### 3. 阶段二 2.4 验证通过后的 JSON 字段更新（必须由主 Agent 执行）
 
-对比一致后，**必须**更新 `scan_result.json` 中对应条目的字段（**权威源在 JSON，不在源码注释**）：
+对比一致后，**主 Agent 必须**更新 `scan_result.json` 中对应条目的字段（**权威源在 JSON，不在源码注释；只有主 Agent 可以写入**）：
 
 ```jsonc
 {
@@ -67,7 +69,7 @@ diff ref.txt riscv.txt
 - 异常：`语义差异：<具体点>，已通过测试规避` 或 `TODO(后续)：<具体项>`
 - 性能影响：`性能低于原实现 N%，原因：<…>，建议进入阶段四 llvm-mca 优化`
 
-更新方式：直接编辑 JSON 文件，或 agent 用 `jq`/Python 改写条目；写回后必须保持 schema 与缩进一致。
+> **Subagent 不得写入 `scan_result.json`**。迁移 Subagent 返回 `READY_FOR_VERIFY` 后，由主 Agent 执行本步骤完成最终状态提交。
 
 ## 验证后分析
 
@@ -77,12 +79,14 @@ diff ref.txt riscv.txt
 
 ## 阶段四（性能分析）触发判定
 
-- 若验证发现某条目性能低于原实现且 `marking` 标注"建议进入阶段四"，则在阶段三通过后召唤 `riscv-asm-analyzer` agent 做 llvm-mca 优化。
+- 若验证发现某条目性能低于原实现且 `marking` 标注"建议进入阶段四"，则在阶段三通过后由主 Agent 召唤 `riscv-asm-analyzer` 做 llvm-mca 优化。
 - 性能分析不在本命令内执行；本命令只保证**正确性**。
+- 阶段四优化后的 `marking` 由主 Agent 在 QEMU 回归验证后统一写入。
 
 ## 约束
 
 - 不依赖虚拟环境；工具链 / QEMU 由技能侧自动部署与加载
 - 每轮迁移改动后应主动触发本验证，不等用户提醒
 - 阶段二每个条目 `status=DONE` 时 `marking` 必填；阶段三产物可运行后才能进入阶段四
+- **只有主 Agent 可以写入 `scan_result.json`**
 - **不要**在源码里写 `// [MIGRATE-*]` 注释；所有状态以 `scan_result.json` 为唯一权威源
