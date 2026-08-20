@@ -8,7 +8,7 @@ prepare_download_dirs
 log "x86_64 cross toolchain"
 require_cmd curl
 
-archive="${TOOLCHAIN_DIR}/x86-toolchain.tar.xz"
+archive="${TOOLCHAIN_DIR}/x86-toolchain.tar.bz2"
 X86_TOOLCHAIN_URL="https://artsz.zte.com.cn:443/artifactory/zf-eco-release-generic/rpm/x86_64_gcc6.2.0_glibc2.24.0.tar.bz2"
 
 if [[ -f "${archive}" ]]; then

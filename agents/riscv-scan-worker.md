@@ -54,6 +54,22 @@ tools: Read, Glob, Grep, Bash
 | `standalone_asm` | `.S` / `.s` / `.asm` 文件 |
 | `arch_macros` | `__x86_64__` / `__i386__` / `__ARM_ARCH` / `__aarch64__` 条件编译 |
 | `build_system` | `Makefile` / `CMakeLists.txt` 中的架构特定编译参数、缺失的 riscv 构建目录 |
+| `autovec_hotspot` | **纯 C 可向量化热点**（无 intrinsic/asm，但数据并行；见下方专节） |
+
+### `autovec_hotspot` 维度细则
+
+识别**不含任何 intrinsic/asm、但 x86/ARM 上靠编译器自动向量化获得性能**的纯 C 热点循环——这类代码迁移后 RV 侧没有任何机制保证向量化（GCC 对 RVV 的自动向量化成本模型保守），漏扫即性能漏损：
+
+**静态启发**（命中越多置信越高）：
+
+- for/while 循环体操作数组元素（`a[i] op b[i] → c[i]` 形态、逐元素归约、查表、字节处理）；
+- 循环次数由数据规模决定（参数化 `n`，非固定小次数）；
+- 循环体内无函数调用（或有可内联的 static 小函数）、分支少、无跨迭代依赖迹象（归纳变量步进、无 `a[i]` 依赖 `a[i+1]` 类递推）；
+- 所在文件/函数有热点迹象：被 benchmark/测试反复调用、命名含 `kernel/loop/process/transform` 等。
+
+**输出**：`solver_type="AutoVecCandidate"`、`tier="hot"`（置信低时 `warm`）、`brief` 写明启发依据（如"逐元素乘加、无跨迭代依赖、循环次数参数化"）。工程已有 profile 数据（perf 报告、benchmark 清单）时按热度排序并在 `brief` 引用来源。
+
+**与 intrinsic/asm 条目重叠时的裁决**：即使行区间与 intrinsic/asm 条目重叠，仍正常返回 AutoVecCandidate 候选（Subagent 不做裁决）；主 Agent 合并时按重叠裁决规则处理——删除 AutoVecCandidate 条目、启发依据并入保留条目 `marking`，并记入 `warnings`。
 
 ## 输出格式
 
@@ -109,9 +125,10 @@ tools: Read, Glob, Grep, Bash
 | `class_type` | `suggestion_class`（源码迁移点）或 `missing_class`（缺失文件/目录） |
 | `file_path` / `missing_path` | 文件路径或缺失路径 |
 | `start_line` / `end_line` | 源码行号区间（`missing_class` 可为空） |
-| `solver_type` | 迁移类型：`InlineAsm` / `Builtin` / `asmFile` / `ArchMacro` / `BuildSystem` |
-| `brief` | 一句话描述 |
-| `arch_source` | 来源架构：`x86` / `x86_64` / `arm` / `aarch64` |
+| `solver_type` | 迁移类型：`InlineAsm` / `Builtin` / `asmFile` / `ArchMacro` / `BuildSystem` / `AutoVecCandidate`。**Subagent 候选条目用字符串标签**（主 Agent 合并时负责与基础扫描器的整数枚举共存，映射见 [project_scan.md](../skills/riscv-migrate/referens/project_scan.md)） |
+| `tier` | 热点优先级：`hot` / `warm` / `cold`（`AutoVecCandidate` 与 intrinsic 热点建议 `hot`） |
+| `brief` | 一句话描述（`AutoVecCandidate` 须写明启发依据） |
+| `arch_source` | 来源架构：`x86` / `x86_64` / `arm` / `aarch64` / `none`（`AutoVecCandidate` 用 `none`） |
 | `code_snippet` | 关键代码片段（可选，帮助主 Agent 去重判断） |
 
 ### 注意

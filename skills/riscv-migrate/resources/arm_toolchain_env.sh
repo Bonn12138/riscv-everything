@@ -8,7 +8,7 @@ prepare_download_dirs
 log "ARM cross toolchain"
 require_cmd curl
 
-archive="${TOOLCHAIN_DIR}/arm-toolchain.tar.xz"
+archive="${TOOLCHAIN_DIR}/arm-toolchain.tar.bz2"
 ARM_TOOLCHAIN_URL="https://artsz.zte.com.cn:443/artifactory/zf-eco-release-generic/rpm/aarch64_gcc14.1.0_glibc2.39.0_fp.tar.bz2"
 
 if [[ -f "${archive}" ]]; then

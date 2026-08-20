@@ -30,16 +30,17 @@ bash "${CLAUDE_PLUGIN_ROOT}/skills/riscv-migrate/scripts/run_scan.sh" <source-di
 
 3. **第二步：评估是否需要并行补充扫描**。主 Agent 根据工程规模判断：
    - 工程较小或扫描覆盖明确 → 无需 Subagent，直接进入合并。
-   - 存在多架构或多独立目录 → 可派发 `riscv-scan-worker`（按维度：x86 intrinsic / ARM NEON / 架构宏 / 构建系统）并行扫描。
-4. **第三步：主 Agent 合并去重**。合并基础扫描结果与 Subagent 候选条目，去重键：`class_type + file_path/missing_path + start_line + end_line + solver_type`。
+   - 存在多架构或多独立目录 → 可派发 `riscv-scan-worker`（按维度：x86 intrinsic / ARM NEON / 架构宏 / 构建系统 / **纯 C 可向量化热点 `autovec_hotspot`**）并行扫描。
+   - **`autovec_hotspot` 维度建议默认派发**（性能目标下最重要）：识别不含 intrinsic/asm、但数据并行的纯 C 热点循环（x86 上靠自动向量化获得性能），标 `solver_type="AutoVecCandidate"`、`tier="hot"`；这类条目将强制走 RVV 完整闭环，防止迁移后向量化静默丢失。
+4. **第三步：主 Agent 合并去重**。合并基础扫描结果与 Subagent 候选条目，去重键：`class_type + file_path/missing_path + start_line + end_line + solver_type`。区间相交但去重键不同的条目按**重叠裁决规则**处理（详规见 SKILL.md 阶段一第三步）：AutoVecCandidate 与 asm/intrinsic 重叠时删 AutoVecCandidate、启发依据并入保留条目 `marking`；同类型相交时保留区间更完整者；所有被丢弃条目记入 `warnings` 可追溯。
 5. 扫描结果写入 `<source-dir>/scan_result.json`（**只有主 Agent 可以写入**）。
-6. **每个条目默认带 `status="TODO"` 与 `marking=""`**（权威源在 JSON，不在源码注释）。
-7. 汇总报告：待迁移点总数、按类型分类（intrinsic / inline asm / .S 文件 / 架构宏）、涉及的文件列表、扫描 Subagent 调度统计（如有）。
+6. **每个条目默认带 `status="TODO"`、`marking=""`、`perf=null`**（权威源在 JSON，不在源码注释）。
+7. 汇总报告：待迁移点总数、按类型分类（intrinsic / inline asm / .S 文件 / 架构宏 / **AutoVecCandidate 可向量化热点**）、涉及的文件列表、扫描 Subagent 调度统计（如有）。
 
 ## 产物
 
-- `scan_result.json` — 迁移点清单，每个条目包含文件路径、行号、类型（`solver_type`）、原始代码片段、建议的 RISC-V 替代方案（如有知识库匹配），以及 `status` / `marking` 字段
-- 阶段二将基于本文件分流（汇编/非汇编）并按条目迁移，通过改写 `status` / `marking` 字段同步进度（仅主 Agent 写入）
+- `scan_result.json` — 迁移点清单，每个条目包含文件路径、行号、类型（`solver_type`）、热点优先级（`tier`）、原始代码片段、建议的 RISC-V 替代方案（映射速查表匹配，如有），以及 `status` / `marking` / `perf` 字段
+- 阶段二将基于本文件分流（汇编/非汇编/AutoVecCandidate）并按条目迁移，通过改写 `status` / `marking` / `perf` 字段同步进度（仅主 Agent 写入）
 
 ## 后续
 

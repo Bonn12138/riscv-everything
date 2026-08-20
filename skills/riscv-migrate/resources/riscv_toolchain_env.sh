@@ -8,7 +8,7 @@ prepare_download_dirs
 log "RISC-V cross toolchain"
 require_cmd curl
 
-archive="${TOOLCHAIN_DIR}/riscv-toolchain.tar.xz"
+archive="${TOOLCHAIN_DIR}/riscv-toolchain.tar.bz2"
 RISCV_TOOLCHAIN_URL="https://artsz.zte.com.cn:443/artifactory/zf-eco-release-generic/rpm/riscv64_gcc14.3.0_glibc2.38.0_fp.tar.bz2"
 
 if [[ -f "${archive}" ]]; then

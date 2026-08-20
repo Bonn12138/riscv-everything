@@ -1,6 +1,6 @@
 ---
 name: riscv-asm-analyzer
-description: 阶段四（独立 agent）：对 RISC-V 热点汇编（手写或 RVV intrinsic 生成的）做 llvm-mca 静态性能分析，定位吞吐瓶颈，给出优化建议与建议 marking。支持绑定唯一热点函数或代码区间；多热点可并行分析。不直接修改 scan_result.json，由主 Agent 统一验收与回写。仅在迁移阶段一/二/三全部通过后召唤。
+description: 阶段四（独立 Subagent）：对 RISC-V 热点汇编（手写或 RVV intrinsic 生成的）做 llvm-mca 静态性能分析，定位吞吐瓶颈，给出优化建议与建议 marking。支持绑定唯一热点函数或代码区间；多热点可并行分析。不直接修改 scan_result.json，由主 Agent 统一验收与回写。仅在迁移阶段一/二/三全部通过后召唤。
 tools: Read, Glob, Grep, Bash
 ---
 
@@ -20,9 +20,9 @@ tools: Read, Glob, Grep, Bash
 | 阶段 | 名称 | 状态 |
 | ---- | ---- | ---- |
 | 一 | 扫描迁移点 | 召唤你之前必须已 DONE（`scan_result.json` 已产出） |
-| 二 | 按迁移点分流迁移 | 所有条目必须已 `status="DONE"` 且 `marking` 非空 |
-| 三 | 工程级交叉编译 | RV 可执行程序必须已在 QEMU 中跑通 |
-| **四（本 agent）** | **性能分析与优化** | **前三阶段全部通过后才触发** |
+| 二 | 按迁移点分流迁移 | 所有条目必须已 `status="DONE"` 且 `marking` 非空（asm/RVV/AutoVec 条目另需 `perf` 非空） |
+| 三 | 工程级交叉编译 + 向量化审计 | RV 可执行程序必须已在 QEMU 中跑通，向量化审计已完成 |
+| **四（本 agent）** | **性能分析与优化** | **前三阶段全部通过后默认对全部 asm/RVV/AutoVec 条目执行** |
 
 ## 约束（必须遵守）
 
@@ -99,10 +99,15 @@ llvm-mca --version
 
 ### 1. 提取汇编热点
 
-从迁移后的代码或 benchmark 中提取热点函数 / 循环体的汇编：
+从迁移后的代码或 benchmark 中提取热点函数 / 循环体的汇编。**工具链事实**：本技能交叉工具链为 GCC 14.3（无 clang），GCC 汇编须先清洗再喂 llvm-mca：
 
 ```bash
-riscv64-unknown-linux-gnu-gcc -O2 -march=rv64gcv -S -o hot.s hot.c
+# C/intrinsic 源：GCC -S + 清洗脚本（剔除 GNU 伪指令/.cfi_*，/* */ → //）
+# 注意 -O 级别必须与工程真实构建一致（默认 -O3），否则分析的汇编与产物不符
+riscv64-unknown-linux-gnu-gcc -O3 -march=<与工程一致> -mabi=lp64d -S -o - hot.c \
+  | bash "${CLAUDE_PLUGIN_ROOT}/skills/riscv-migrate/scripts/clean_asm_for_mca.sh" - - > hot.s
+
+# 手写 .S：通常可直接用；含 GNU 伪指令时同样过清洗脚本
 ```
 
 如果目标是 intrinsic 函数，编译时加 `-g` 保留调试符号，然后从 `.s` 文件中裁剪目标函数的指令序列。
@@ -135,7 +140,7 @@ bnez    a0, hot_loop
 llvm-mca -mtriple=riscv64 -mcpu=<target-cpu> -timeline -iterations=100 hot_loop.s
 ```
 
-**`-mcpu` 选择优先级**：用户 prompt 中明确指定 > `zhufeng2`（默认） > 目标部署芯片匹配 > `sifive-p450`（乱序通用基线）/ `sifive-u74`（顺序通用基线）。**不要用 `generic`/`generic-rv64`**（无调度模型会导致报错）。
+**`-mcpu` 选择优先级**：**唯一权威见 code_migrate.md「推荐的 -mcpu 值」一节**（概述：用户 prompt 中明确指定 > `zhufeng2`（默认，VLEN=256）> 目标部署芯片匹配 > `sifive-p450`（乱序通用基线）/ `sifive-u74`（顺序通用基线））。**不要用 `generic`/`generic-rv64`**（无调度模型会导致报错）。
 
 关键输出指标：
 - **IPC**（指令每周期数）：越高越好，理论最大值受限于发射宽度
@@ -215,10 +220,12 @@ llvm-mca -mtriple=riscv64 -mcpu=<target-cpu> -timeline -iterations=100 hot_loop.
 
 - **不**修改迁移策略（分流、汇编 vs 非汇编判定由阶段二 2.1 决定）
 - **不**直接写 `scan_result.json`（由主 Agent 在回归验证后统一写入）
-- **不**跳过验证步骤：每轮优化建议被采纳后，必须由主 Agent 执行阶段二 2.4 的 QEMU 回归验证
+- **不**跳过验证步骤：每轮优化建议被采纳后，必须由主 Agent 执行阶段二 2.4 的 QEMU 回归验证 **+ L2 指令数回归**（防止 mca 局部改善但整体指令数上升）
+- **A/B 支持**：优化建议含多个候选方案时（intrinsic vs asm、不同 LMUL、软件流水与否），返回所有方案的度量数据与推荐，由主 Agent 按 `referens/perf_measure.md` 第 5 节判据择优
 
 ## 注意事项
 
 - **输出路径**：所有临时产物（`hot.s`、`llvm-mca` 输出等）写入 `<project_root>/.riscv-migrate/tasks/<task_id>/`，不污染工程目录
 - **注释格式警告**：`.text` 段内**禁止**行尾 `/* */` 注释；只允许 `//` 或 `#`
-- **停止优化**：IPC ≥ Dispatch × 0.7 **且** 连续两轮 Block RThroughput 差距 < 5% 时停止
+- **性能口径**：只引用 llvm-mca 静态指标（L1）与主 Agent 提供的指令数数据（L2）；**不使用** QEMU wall-clock 或跨架构时间比（口径见 `referens/perf_measure.md`）
+- **停止优化**：以 SKILL.md A 节 #10 为唯一口径——IPC ≥ Dispatch × 0.7 **且** 连续两轮 Block RThroughput 差距 < 5% **且** 输出 `No resource or data dependency bottlenecks`（三条件同时满足）
